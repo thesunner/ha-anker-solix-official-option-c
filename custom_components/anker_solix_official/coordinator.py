@@ -12,6 +12,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.helpers import device_registry as dr
 
+from .acquisition import (
+    BATTERY_POWER_REGISTER,
+    AcquisitionFailureClass,
+    BatteryPowerAcquisition,
+    RegisterReadDiagnostics,
+)
 from .const import DOMAIN, SCAN_INTERVAL, LOG_THROTTLE_INTERVAL, CONNECTION_RETRY_DELAY
 from .modbus_manager import ModbusConnectionManager
 from .device_config import AnkerSolixDeviceConfig
@@ -103,6 +109,15 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
         )
 
         self._unavailable_registers: set[int] = set()
+        self._battery_power_poll_generation = 0
+        self._battery_power_requires_fresh_sample = False
+        self._battery_power_acquisition = BatteryPowerAcquisition(
+            battery_power_raw_w=None,
+            acquisition_valid=False,
+            poll_generation=0,
+            acquired_at=None,
+            failure_class=AcquisitionFailureClass.DISCONNECTED,
+        )
 
         # Connection state tracking (initialize before reading device model)
         self._connection_failed = False
@@ -492,6 +507,101 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
             return None
         return config.get("address")
 
+    @property
+    def battery_power_acquisition(self) -> BatteryPowerAcquisition:
+        """Return the latest atomic register-10008 acquisition record."""
+        return self._battery_power_acquisition
+
+    def _last_read_diagnostics(
+        self, data: dict[str, Any]
+    ) -> RegisterReadDiagnostics:
+        """Read one immutable diagnostic snapshot without triggering I/O."""
+        getter = getattr(self.modbus_manager, "get_last_read_diagnostics", None)
+        if callable(getter):
+            return getter()
+        return RegisterReadDiagnostics(connected=bool(data))
+
+    def _begin_battery_power_poll(self) -> int:
+        """Allocate one generation and clear all prior success semantics."""
+        self._battery_power_poll_generation += 1
+        self._battery_power_acquisition = BatteryPowerAcquisition(
+            battery_power_raw_w=None,
+            acquisition_valid=False,
+            poll_generation=self._battery_power_poll_generation,
+            acquired_at=None,
+            failure_class=AcquisitionFailureClass.COMPLETE_POLL_FAILURE,
+        )
+        return self._battery_power_poll_generation
+
+    def _record_battery_power_failure(
+        self,
+        failure_class: AcquisitionFailureClass,
+        *,
+        poll_generation: int | None = None,
+    ) -> None:
+        """Publish a failure without allocating a second poll generation."""
+        generation = (
+            self._battery_power_poll_generation
+            if poll_generation is None
+            else poll_generation
+        )
+        self._battery_power_acquisition = BatteryPowerAcquisition(
+            battery_power_raw_w=None,
+            acquisition_valid=False,
+            poll_generation=generation,
+            acquired_at=None,
+            failure_class=failure_class,
+        )
+
+    def _complete_battery_power_acquisition(
+        self,
+        data: dict[str, Any],
+        diagnostics: RegisterReadDiagnostics,
+        *,
+        poll_generation: int,
+    ) -> BatteryPowerAcquisition:
+        """Freeze strict receipt evidence from one completed full poll."""
+        if poll_generation != self._battery_power_poll_generation:
+            raise ValueError("battery-power poll generation is not current")
+
+        read_outcome = diagnostics.battery_power
+        if not diagnostics.connected:
+            failure = AcquisitionFailureClass.DISCONNECTED
+        elif not read_outcome.acquisition_valid:
+            if (
+                not data
+                and read_outcome.failure_class
+                is AcquisitionFailureClass.RANGE_MISSING
+            ):
+                failure = AcquisitionFailureClass.COMPLETE_POLL_FAILURE
+            else:
+                failure = read_outcome.failure_class
+        else:
+            failure = None
+
+        if (
+            self._battery_power_requires_fresh_sample
+            and diagnostics.connected
+            and failure is not None
+        ):
+            failure = AcquisitionFailureClass.RECONNECT_NO_FRESH_SAMPLE
+
+        if failure is not None:
+            self._record_battery_power_failure(
+                failure, poll_generation=poll_generation
+            )
+            return self._battery_power_acquisition
+
+        self._battery_power_acquisition = BatteryPowerAcquisition(
+            battery_power_raw_w=read_outcome.battery_power_raw_w,
+            acquisition_valid=True,
+            poll_generation=poll_generation,
+            acquired_at=read_outcome.sample_acquired_at,
+            failure_class=AcquisitionFailureClass.NONE,
+        )
+        self._battery_power_requires_fresh_sample = False
+        return self._battery_power_acquisition
+
     async def _update_unavailable_registers(self) -> None:
         try:
             client = await self.modbus_manager.get_client()
@@ -706,7 +816,9 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
 
         return True
 
-    async def _handle_connection_failure(self, error_msg: str):
+    async def _handle_connection_failure(
+        self, error_msg: str, *, acquisition_already_completed: bool = False
+    ):
         """Handle connection failure with HA best-practice logging.
 
         HA Integration Quality Scale rule 'log-when-unavailable':
@@ -719,6 +831,11 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
         self._connection_failed = True
         self._status = "disconnected"
         self._latest_data = {}
+        self._battery_power_requires_fresh_sample = True
+        if not acquisition_already_completed:
+            self._record_battery_power_failure(
+                AcquisitionFailureClass.DISCONNECTED
+            )
 
         # Immediately notify HA that data is no longer valid
         # This makes entities show "unavailable" instead of stale values
@@ -930,10 +1047,16 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
                         if self._device_config_cache
                         else 0,
                     )
+                    poll_generation = self._begin_battery_power_poll()
                     data = await self.modbus_manager.get_all_data(
                         self._device_config_cache,
                         batch_ranges=self._batch_ranges_cache,
                         use_batch_optimization=True,
+                    )
+                    self._complete_battery_power_acquisition(
+                        data,
+                        self._last_read_diagnostics(data),
+                        poll_generation=poll_generation,
                     )
                     await self._update_unavailable_registers()
                     if not data:
@@ -941,7 +1064,10 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
                         self.logger.warning(
                             "[bg] initial data fetch returned empty data"
                         )
-                        await self._handle_connection_failure("[bg] initial data fetch returned empty")
+                        await self._handle_connection_failure(
+                            "[bg] initial data fetch returned empty",
+                            acquisition_already_completed=True,
+                        )
                         await asyncio.sleep(self._connection_retry_interval)
                         continue
 
@@ -1066,10 +1192,16 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
 
                     if self._is_config_cache_valid():
                         self.logger.debug("[bg] Starting periodic data read")
+                        poll_generation = self._begin_battery_power_poll()
                         data = await self.modbus_manager.get_all_data(
                             self._device_config_cache,
                             batch_ranges=self._batch_ranges_cache,
                             use_batch_optimization=True,
+                        )
+                        self._complete_battery_power_acquisition(
+                            data,
+                            self._last_read_diagnostics(data),
+                            poll_generation=poll_generation,
                         )
                         await self._update_unavailable_registers()
                         if data:
@@ -1102,9 +1234,13 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
                                 self._consecutive_failures + 1,
                             )
                             if self._consecutive_failures >= 2:
-                                await self._handle_connection_failure("[bg] periodic data fetch failed after multiple attempts")
+                                await self._handle_connection_failure(
+                                    "[bg] periodic data fetch failed after multiple attempts",
+                                    acquisition_already_completed=True,
+                                )
                             else:
                                 self._consecutive_failures += 1
+                                self.async_update_listeners()
             except asyncio.CancelledError:
                 break
             except Exception as e:

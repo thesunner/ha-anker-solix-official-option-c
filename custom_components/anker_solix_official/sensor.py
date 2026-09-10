@@ -12,7 +12,8 @@ from homeassistant.components.sensor import (
     SensorDeviceClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.const import (
@@ -24,6 +25,7 @@ from homeassistant.const import (
     UnitOfElectricCurrent,
 )
 
+from .acquisition import BATTERY_POWER_REGISTER
 from .const import DOMAIN
 from .coordinator import AnkerSolixOfficialCoordinator
 from .base_entity import AnkerSolixBaseEntity, async_setup_entities_with_retry
@@ -61,7 +63,71 @@ async def async_setup_entry(
         entity_filter=_is_sensor_entity,
         entity_factory=lambda c, k, cfg: ModbusLocalDeviceSensor(c, k, cfg),
         platform_name="sensor",
+        additional_entity_factory=lambda data_points: (
+            [BatteryPowerAcquisitionSensor(coordinator)]
+            if any(
+                config.get("address") == BATTERY_POWER_REGISTER
+                for config in data_points.values()
+            )
+            else []
+        ),
     )
+
+
+class BatteryPowerAcquisitionSensor(AnkerSolixBaseEntity, SensorEntity):
+    """Atomic acquisition evidence for signed battery register 10008."""
+
+    def __init__(self, coordinator: AnkerSolixOfficialCoordinator) -> None:
+        """Initialize the additive diagnostic sensor."""
+        super().__init__(
+            coordinator,
+            "battery_power_acquisition_10008",
+            {"address": BATTERY_POWER_REGISTER},
+        )
+        self._attr_translation_key = None
+        self._attr_name = "Battery power acquisition"
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_device_class = SensorDeviceClass.POWER
+        self._attr_native_unit_of_measurement = UnitOfPower.WATT
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._acquisition_snapshot = coordinator.battery_power_acquisition
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Freeze state and attributes before one synchronous HA write."""
+        self._acquisition_snapshot = self.coordinator.battery_power_acquisition
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Expose no numeric state unless this generation is valid."""
+        return self._acquisition_snapshot.acquisition_valid
+
+    @property
+    def native_value(self) -> StateType:
+        """Return the exact signed value, including genuine zero."""
+        acquisition = self._acquisition_snapshot
+        if not acquisition.acquisition_valid:
+            return None
+        return acquisition.battery_power_raw_w
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose one coherent generation-scoped acquisition record."""
+        acquisition = self._acquisition_snapshot
+        return {
+            "battery_power_raw_w": acquisition.battery_power_raw_w,
+            "acquisition_valid": acquisition.acquisition_valid,
+            "poll_generation": acquisition.poll_generation,
+            "acquired_at": (
+                acquisition.acquired_at.isoformat()
+                if acquisition.acquired_at is not None
+                else None
+            ),
+            "failure_class": acquisition.failure_class.value,
+            "modbus_address": BATTERY_POWER_REGISTER,
+            "signed_semantics": "negative_charging_positive_discharging",
+        }
 
 
 class ModbusLocalDeviceSensor(AnkerSolixBaseEntity, SensorEntity):

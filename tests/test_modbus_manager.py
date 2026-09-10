@@ -8,9 +8,16 @@ exercised without any real Modbus client or TCP socket.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from dataclasses import dataclass, field
 from typing import Any
 
+from custom_components.anker_solix_official.acquisition import (
+    BATTERY_POWER_REGISTER_WORDS,
+    AcquisitionFailureClass,
+    BatteryPowerReadOutcome,
+    RegisterReadDiagnostics,
+)
 from custom_components.anker_solix_official.device_logger import WriteResult
 from custom_components.anker_solix_official.modbus_manager import (
     ModbusConnectionManager,
@@ -31,6 +38,7 @@ class _FakeClient:
     get_all_data_result: dict = field(default_factory=dict)
     disconnect_called: bool = False
     connect_call_count: int = 0
+    read_diagnostics: RegisterReadDiagnostics | None = None
 
     def is_connected(self) -> bool:
         return self.connected
@@ -58,6 +66,9 @@ class _FakeClient:
 
     async def get_all_data(self, data_points, batch_ranges, use_batch_optimization) -> dict:
         return self.get_all_data_result
+
+    def get_last_read_diagnostics(self) -> RegisterReadDiagnostics:
+        return self.read_diagnostics or RegisterReadDiagnostics(connected=self.connected)
 
     def get_connection_info(self) -> dict:
         return {"connected": self.connected}
@@ -398,6 +409,29 @@ class TestGetAllData:
         result = await manager.get_all_data({"a": {"address": 1}})
 
         assert result == {}
+
+    async def test_failed_reconnect_clears_previous_success_diagnostics(self) -> None:
+        old_success = RegisterReadDiagnostics(
+            connected=True,
+            battery_power=BatteryPowerReadOutcome(
+                successful_words=BATTERY_POWER_REGISTER_WORDS,
+                failed_words=frozenset(),
+                battery_power_raw_w=0,
+                sample_acquired_at=datetime(2026, 9, 10, 10, 0, tzinfo=UTC),
+                failure_class=AcquisitionFailureClass.NONE,
+            ),
+        )
+        fake = _FakeClient(connected=False, connect_results=[False])
+        manager = _initialized_manager(fake)
+        manager._last_read_diagnostics = old_success
+
+        result = await manager.get_all_data({"a": {"address": 1}})
+        diagnostics = manager.get_last_read_diagnostics()
+
+        assert result == {}
+        assert diagnostics.connected is False
+        assert diagnostics.battery_power.acquisition_valid is False
+
 
     async def test_client_exception_returns_empty_dict(self) -> None:
         class _ExplodingClient(_FakeClient):

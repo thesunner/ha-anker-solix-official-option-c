@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Optional
 
+from .acquisition import RegisterReadDiagnostics
 from .const import CONNECTION_CHECK_INTERVAL
 from .device_logger import WriteResult
 from .modbus_client import AnkerSolixModbusClient
@@ -27,6 +28,7 @@ class ModbusConnectionManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._is_initialized = False
         self._connected_event = asyncio.Event()
+        self._last_read_diagnostics = RegisterReadDiagnostics(connected=False)
 
     def initialize(
         self, ip_address: str, port: int = 502, device_name: str | None = None
@@ -154,6 +156,10 @@ class ModbusConnectionManager:
             self._logger.error(
                 "Exception occurred while cleaning up connection: %s", e, exc_info=True
             )
+
+    def get_last_read_diagnostics(self) -> RegisterReadDiagnostics:
+        """Return the immutable outcomes of the most recent read cycle."""
+        return self._last_read_diagnostics
 
     async def read_register(self, address: int, data_type: str, count: int = None):
         """Read register"""
@@ -384,6 +390,7 @@ class ModbusConnectionManager:
             "get_all_data called with %d data points",
             len(data_points) if data_points else 0,
         )
+        self._last_read_diagnostics = RegisterReadDiagnostics(connected=False)
         if not self._io_lock:
             return {}
 
@@ -401,6 +408,14 @@ class ModbusConnectionManager:
                     batch_ranges,
                     use_batch_optimization,
                 )
+                diagnostics_getter = getattr(
+                    client, "get_last_read_diagnostics", None
+                )
+                self._last_read_diagnostics = (
+                    diagnostics_getter()
+                    if callable(diagnostics_getter)
+                    else RegisterReadDiagnostics(connected=client.is_connected())
+                )
                 self._last_activity = time.time()
                 self._logger.debug(
                     "get_all_data completed, got %d results",
@@ -408,6 +423,9 @@ class ModbusConnectionManager:
                 )
                 return result if result else {}
             except Exception as e:
+                self._last_read_diagnostics = RegisterReadDiagnostics(
+                    connected=client.is_connected()
+                )
                 self._logger.error("Failed to batch read data: %s", e, exc_info=True)
                 return {}
 
