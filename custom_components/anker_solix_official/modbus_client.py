@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import pymodbus
@@ -13,6 +14,13 @@ from pymodbus.exceptions import (
     ModbusException,
 )
 
+from .acquisition import (
+    BATTERY_POWER_REGISTER,
+    BATTERY_POWER_REGISTER_WORDS,
+    AcquisitionFailureClass,
+    BatteryPowerReadOutcome,
+    RegisterReadDiagnostics,
+)
 from .batch_reader import BatchRegisterReader
 from .const import MODBUS_RESPONSE_TIMEOUT
 from .device_logger import WriteResult
@@ -128,6 +136,10 @@ class AnkerSolixModbusClient:
         # Track registers that failed to read (for entity availability)
         self._last_failed_registers: set[int] = set()
         self._last_successful_registers: set[int] = set()
+        self._last_register_failure_classes: dict[
+            int, AcquisitionFailureClass
+        ] = {}
+        self._last_battery_power_read = BatteryPowerReadOutcome()
 
     def get_last_failed_registers(self) -> set[int]:
         """Get set of register addresses that failed in the last read operation."""
@@ -136,6 +148,114 @@ class AnkerSolixModbusClient:
     def get_last_successful_registers(self) -> set[int]:
         """Get set of register addresses that succeeded in the last read operation."""
         return self._last_successful_registers.copy()
+
+    def get_last_read_diagnostics(self) -> RegisterReadDiagnostics:
+        """Return an immutable snapshot from the most recent physical sweep."""
+        return RegisterReadDiagnostics(
+            successful_registers=frozenset(self._last_successful_registers),
+            failed_registers=frozenset(self._last_failed_registers),
+            failure_classes=tuple(
+                sorted(self._last_register_failure_classes.items())
+            ),
+            connected=self.is_connected(),
+            battery_power=self._last_battery_power_read,
+        )
+
+    def _record_register_failure(
+        self, address: int, failure_class: AcquisitionFailureClass
+    ) -> None:
+        """Record one root failure without replacing a more specific cause."""
+        self._last_failed_registers.add(address)
+        self._last_register_failure_classes.setdefault(address, failure_class)
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        """Return a timezone-aware UTC physical receipt timestamp."""
+        return datetime.now(UTC)
+
+    @staticmethod
+    def _decode_battery_power_int32_strict(registers: list[Any]) -> int:
+        """Decode the exact two 16-bit words at 10008 as signed INT32."""
+        if len(registers) != 2:
+            raise _RegisterDecodeError(
+                f"Register {BATTERY_POWER_REGISTER} requires exactly 2 values"
+            )
+        if any(
+            isinstance(word, bool) or not isinstance(word, int)
+            for word in registers
+        ):
+            raise _RegisterDecodeError(
+                f"Register {BATTERY_POWER_REGISTER} contains non-integer values"
+            )
+        if any(word < 0 or word > 0xFFFF for word in registers):
+            raise _RegisterDecodeError(
+                f"Register {BATTERY_POWER_REGISTER} contains out-of-range values"
+            )
+
+        unsigned = (registers[0] << 16) | registers[1]
+        return unsigned - 0x100000000 if unsigned & 0x80000000 else unsigned
+
+    def _capture_battery_power_response(
+        self,
+        *,
+        start: int,
+        requested_count: int,
+        registers: list[Any],
+    ) -> None:
+        """Freeze evidence only when one response requested both component words."""
+        requested_end = start + requested_count - 1
+        if not (
+            start <= BATTERY_POWER_REGISTER
+            and requested_end >= BATTERY_POWER_REGISTER + 1
+        ):
+            return
+
+        addresses = sorted(BATTERY_POWER_REGISTER_WORDS)
+        offsets = [address - start for address in addresses]
+        present = [
+            offset < len(registers) and registers[offset] is not None
+            for offset in offsets
+        ]
+        if not all(present):
+            successful_words = frozenset(
+                address
+                for address, is_present in zip(addresses, present, strict=True)
+                if is_present
+            )
+            self._last_battery_power_read = BatteryPowerReadOutcome(
+                successful_words=successful_words,
+                failed_words=BATTERY_POWER_REGISTER_WORDS - successful_words,
+                failure_class=(
+                    AcquisitionFailureClass.PARTIAL_READ_MISSING
+                    if successful_words
+                    else AcquisitionFailureClass.RANGE_MISSING
+                ),
+            )
+            return
+
+        words = [registers[offset] for offset in offsets]
+        received_at = self._utcnow()
+        try:
+            raw_value = self._decode_battery_power_int32_strict(words)
+        except Exception as exc:
+            self._record_register_failure(
+                BATTERY_POWER_REGISTER, AcquisitionFailureClass.DECODE_FAILURE
+            )
+            self._last_battery_power_read = BatteryPowerReadOutcome(
+                successful_words=BATTERY_POWER_REGISTER_WORDS,
+                failed_words=frozenset(),
+                failure_class=AcquisitionFailureClass.DECODE_FAILURE,
+            )
+            self._logger.debug("Strict register-10008 decode failed: %s", exc)
+            return
+
+        self._last_battery_power_read = BatteryPowerReadOutcome(
+            successful_words=BATTERY_POWER_REGISTER_WORDS,
+            failed_words=frozenset(),
+            battery_power_raw_w=raw_value,
+            sample_acquired_at=received_at,
+            failure_class=AcquisitionFailureClass.NONE,
+        )
 
     def _create_client(self) -> AsyncModbusTcpClient:
         """Create the persistent pymodbus async client.
@@ -190,7 +310,7 @@ class AnkerSolixModbusClient:
                     self.port,
                 )
             return False
-        except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+        except (TimeoutError, ConnectionError, OSError) as e:
             self._connection_status = "error"
             # Log connection error with appropriate level based on error frequency
             if self._consecutive_errors == 0:
@@ -300,14 +420,7 @@ class AnkerSolixModbusClient:
                 result = await self.client.read_input_registers(
                     address=address, count=count
                 )
-        except (
-            ConnectionError,
-            OSError,
-            asyncio.TimeoutError,
-            ValueError,
-            ConnectionException,
-            ModbusException,
-        ) as exc:
+        except (TimeoutError, ConnectionError, OSError, ValueError, ConnectionException, ModbusException) as exc:
             self._handle_connection_error(
                 f"Exception reading out-of-range address {address} ({reg_type}): {exc}",
                 exc=exc,
@@ -557,7 +670,7 @@ class AnkerSolixModbusClient:
             return self._default_value(data_type)
 
     async def read_register(
-        self, address: int, data_type: str, count: int = None
+        self, address: int, data_type: str, count: int | None = None
     ) -> Any | None:
         """Read input register (function code 04)."""
         if not self.is_connected():
@@ -593,13 +706,7 @@ class AnkerSolixModbusClient:
                 f"Exception reading register {address}: {e}", exc=e
             )
             return None
-        except (
-            ConnectionError,
-            OSError,
-            asyncio.TimeoutError,
-            ValueError,
-            ModbusException,
-        ) as e:
+        except (TimeoutError, ConnectionError, OSError, ValueError, ModbusException) as e:
             self._handle_connection_error(
                 f"Exception reading register {address}: {e}", exc=e
             )
@@ -673,14 +780,7 @@ class AnkerSolixModbusClient:
                 pn_hash = hashlib.sha256((salt + device_pn).encode()).hexdigest()
                 return (pn_hash, device_pn, raw_hex)
 
-            except (
-                ConnectionError,
-                OSError,
-                asyncio.TimeoutError,
-                BrokenPipeError,
-                ConnectionException,
-                ModbusException,
-            ) as e:
+            except (TimeoutError, ConnectionError, OSError, BrokenPipeError, ConnectionException, ModbusException) as e:
                 # Handle connection errors - force disconnect and retry.
                 # Not passing exc= to _handle_connection_error(): this
                 # method already force-disconnects explicitly below on
@@ -968,6 +1068,11 @@ class AnkerSolixModbusClient:
         Returns:
             Dictionary of data point values
         """
+        self._last_failed_registers.clear()
+        self._last_successful_registers.clear()
+        self._last_register_failure_classes.clear()
+        self._last_battery_power_read = BatteryPowerReadOutcome()
+
         if data_points is None:
             self._logger.info("No data points provided, cannot read data")
             return {}
@@ -997,6 +1102,32 @@ class AnkerSolixModbusClient:
         self._last_successful_registers.clear()
 
         range_data: dict[tuple[int, int], list[int]] = {}
+        separate_battery_words_seen: set[int] = set()
+        battery_expected = any(
+            config.get("address") == BATTERY_POWER_REGISTER
+            for config in data_points.values()
+        )
+
+        def range_contains_battery(start: int, count: int) -> bool:
+            end = start + count - 1
+            return (
+                start <= BATTERY_POWER_REGISTER
+                and end >= BATTERY_POWER_REGISTER + 1
+            )
+
+        def record_battery_range_failure(
+            start: int,
+            count: int,
+            failure: AcquisitionFailureClass,
+        ) -> None:
+            if not battery_expected or not range_contains_battery(start, count):
+                return
+            for address in BATTERY_POWER_REGISTER_WORDS:
+                self._last_register_failure_classes.setdefault(address, failure)
+            self._last_battery_power_read = BatteryPowerReadOutcome(
+                failure_class=failure
+            )
+
         processed_keys = set()
 
         # Bounds how long one get_all_data() can hold the manager's I/O lock.
@@ -1020,6 +1151,9 @@ class AnkerSolixModbusClient:
                 if device_unresponsive:
                     for addr in range(start, end + 1):
                         self._last_failed_registers.add(addr)
+                    record_battery_range_failure(
+                        start, register_count, AcquisitionFailureClass.MODBUS_ERROR
+                    )
                     continue
 
                 retried = False
@@ -1035,14 +1169,7 @@ class AnkerSolixModbusClient:
                                 address=start, count=register_count
                             )
                         break
-                    except (
-                        ConnectionError,
-                        OSError,
-                        asyncio.TimeoutError,
-                        ValueError,
-                        ConnectionException,
-                        ModbusException,
-                    ) as exc:
+                    except (TimeoutError, ConnectionError, OSError, ValueError, ConnectionException, ModbusException) as exc:
                         self._handle_connection_error(
                             f"Exception reading configured range {start}-{end} ({reg_type}): {exc}",
                             exc=exc,
@@ -1058,6 +1185,11 @@ class AnkerSolixModbusClient:
                             )
                             for addr in range(start, end + 1):
                                 self._last_failed_registers.add(addr)
+                            record_battery_range_failure(
+                                start,
+                                register_count,
+                                AcquisitionFailureClass.MODBUS_ERROR,
+                            )
                             result = None
                             break
                         retried = True
@@ -1076,6 +1208,11 @@ class AnkerSolixModbusClient:
                             device_unresponsive = True
                             for addr in range(start, end + 1):
                                 self._last_failed_registers.add(addr)
+                            record_battery_range_failure(
+                                start,
+                                register_count,
+                                AcquisitionFailureClass.MODBUS_ERROR,
+                            )
                             result = None
                             break
                         # Loop back and retry the read exactly once.
@@ -1115,6 +1252,8 @@ class AnkerSolixModbusClient:
                                     individual_reads[offset] = individual_registers[0]
                                     successful_individual += 1
                                     self._last_successful_registers.add(addr)
+                                    if addr in BATTERY_POWER_REGISTER_WORDS:
+                                        separate_battery_words_seen.add(addr)
                                     self._logger.debug(
                                         "Individual read successful: address=%d, value=%s",
                                         addr,
@@ -1137,6 +1276,23 @@ class AnkerSolixModbusClient:
                                 individual_exc,
                             )
 
+                    target_words = (
+                        BATTERY_POWER_REGISTER_WORDS & separate_battery_words_seen
+                    )
+                    if range_contains_battery(start, register_count):
+                        if target_words:
+                            self._last_battery_power_read = BatteryPowerReadOutcome(
+                                failure_class=(
+                                    AcquisitionFailureClass.PARTIAL_READ_MISSING
+                                )
+                            )
+                        else:
+                            record_battery_range_failure(
+                                start,
+                                register_count,
+                                AcquisitionFailureClass.MODBUS_ERROR,
+                            )
+
                     # Only add to range_data if we got at least one successful read
                     if successful_individual > 0:
                         range_data[(start, end)] = individual_reads
@@ -1151,6 +1307,11 @@ class AnkerSolixModbusClient:
 
                 registers = getattr(result, "registers", None) or getattr(
                     result, "data", None
+                )
+                self._capture_battery_power_response(
+                    start=start,
+                    requested_count=register_count,
+                    registers=list(registers or []),
                 )
                 if not registers or len(registers) < register_count:
                     self._logger.error(
@@ -1177,19 +1338,12 @@ class AnkerSolixModbusClient:
                         address=group.start_address,
                         count=group.count,
                     )
-                except (
-                    ConnectionError,
-                    OSError,
-                    asyncio.TimeoutError,
-                    ValueError,
-                    ConnectionException,
-                    ModbusException,
-                ) as exc:
+                except (TimeoutError, ConnectionError, OSError, ValueError, ConnectionException, ModbusException) as exc:
                     self._handle_connection_error(
                         f"Exception reading register group starting at {group.start_address}: {exc}",
                         exc=exc,
                     )
-                    for key, config in group.data_points:
+                    for _key, config in group.data_points:
                         failed_reads += 1
                         self._last_failed_registers.add(int(config["address"]))
                     continue
@@ -1200,7 +1354,7 @@ class AnkerSolixModbusClient:
                         group.start_address,
                         result,
                     )
-                    for key, config in group.data_points:
+                    for _key, config in group.data_points:
                         failed_reads += 1
                         address = int(config["address"])
                         self._last_failed_registers.add(address)
@@ -1208,6 +1362,11 @@ class AnkerSolixModbusClient:
 
                 registers = getattr(result, "registers", None) or getattr(
                     result, "data", None
+                )
+                self._capture_battery_power_response(
+                    start=group.start_address,
+                    requested_count=group.count,
+                    registers=list(registers or []),
                 )
                 if not registers or len(registers) < group.count:
                     self._logger.error(
@@ -1217,7 +1376,7 @@ class AnkerSolixModbusClient:
                         group.count,
                         len(registers) if registers else 0,
                     )
-                    for key, config in group.data_points:
+                    for _key, config in group.data_points:
                         failed_reads += 1
                         self._last_failed_registers.add(int(config["address"]))
                     continue
@@ -1232,8 +1391,7 @@ class AnkerSolixModbusClient:
 
                         if offset < 0 or slice_end > len(registers):
                             raise IndexError(
-                                "Data point %s exceeds group bounds: offset=%s, end=%s, len=%s"
-                                % (key, offset, slice_end, len(registers))
+                                f"Data point {key} exceeds group bounds: offset={offset}, end={slice_end}, len={len(registers)}"
                             )
 
                         dp_registers = registers[offset:slice_end]
@@ -1359,6 +1517,11 @@ class AnkerSolixModbusClient:
                     start = address
                     end = address + count - 1
                     registers = single_registers
+                    self._capture_battery_power_response(
+                        start=start,
+                        requested_count=count,
+                        registers=registers,
+                    )
                     source = f"single read ({reg_type})"
                 else:
                     start, end, registers = range_entry
@@ -1423,6 +1586,8 @@ class AnkerSolixModbusClient:
                 )
 
         self._last_successful_registers -= self._last_failed_registers
+        for address in self._last_successful_registers:
+            self._last_register_failure_classes.pop(address, None)
 
         if failed_reads:
             self._logger.debug(

@@ -352,6 +352,7 @@ async def async_setup_entities_with_retry(
     entity_filter: Callable[[str, dict], bool],
     entity_factory: Callable[[AnkerSolixOfficialCoordinator, str, dict], Any],
     platform_name: str,
+    additional_entity_factory: Callable[[dict], list[Any]] | None = None,
 ) -> None:
     """Create this platform's entities from the coordinator's device config.
 
@@ -376,6 +377,8 @@ async def async_setup_entities_with_retry(
         for key, config in data_points.items()
         if entity_filter(key, config)
     ]
+    if additional_entity_factory is not None:
+        entities.extend(additional_entity_factory(data_points))
     if entities:
         async_add_entities(entities)
         _LOGGER.debug("Added %d %s entities", len(entities), platform_name)

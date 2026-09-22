@@ -3,14 +3,20 @@
 import asyncio
 import logging
 import time
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .acquisition import (
+    AcquisitionFailureClass,
+    BatteryPowerAcquisition,
+    RegisterReadDiagnostics,
+)
 from .config_utils import parse_device_configuration
 from .const import (
     DOMAIN,
@@ -98,6 +104,7 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
         )
 
         self._unavailable_registers: set[int] = set()
+        self._initialize_battery_power_acquisition()
 
         # Consecutive failure count is kept only to drive the mDNS re-discovery
         # trigger; retry scheduling itself belongs to DataUpdateCoordinator.
@@ -434,6 +441,126 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
                 "Failed to inject version gates: %s", e, exc_info=True
             )
 
+    @staticmethod
+    def _utcnow() -> datetime:
+        """Return a timezone-aware UTC producer retrieval timestamp."""
+        return datetime.now(UTC)
+
+    def _initialize_battery_power_acquisition(
+        self, *, lifecycle_epoch: str | None = None
+    ) -> None:
+        """Establish a new producer lifecycle with no inherited evidence."""
+        self._battery_power_lifecycle_epoch = lifecycle_epoch or uuid4().hex
+        self._battery_power_poll_generation = 0
+        self._battery_power_requires_fresh_sample = False
+        self._battery_power_acquisition = BatteryPowerAcquisition(
+            lifecycle_epoch=self._battery_power_lifecycle_epoch,
+            poll_generation=0,
+            retrieved_at=self._utcnow(),
+            battery_power_raw_w=None,
+            acquisition_valid=False,
+            acquired_at=None,
+            failure_class=AcquisitionFailureClass.DISCONNECTED,
+        )
+
+    @property
+    def battery_power_acquisition(self) -> BatteryPowerAcquisition:
+        """Return the latest immutable producer attempt."""
+        return self._battery_power_acquisition
+
+    def _begin_battery_power_poll(self) -> int:
+        """Allocate one attempt identity and clear prior success semantics."""
+        self._battery_power_poll_generation += 1
+        self._battery_power_acquisition = BatteryPowerAcquisition(
+            lifecycle_epoch=self._battery_power_lifecycle_epoch,
+            poll_generation=self._battery_power_poll_generation,
+            retrieved_at=self._utcnow(),
+            battery_power_raw_w=None,
+            acquisition_valid=False,
+            acquired_at=None,
+            failure_class=AcquisitionFailureClass.COMPLETE_POLL_FAILURE,
+        )
+        return self._battery_power_poll_generation
+
+    def _record_battery_power_failure(
+        self,
+        failure_class: AcquisitionFailureClass,
+        *,
+        poll_generation: int,
+    ) -> BatteryPowerAcquisition:
+        """Publish an invalid result without allocating another generation."""
+        self._battery_power_acquisition = BatteryPowerAcquisition(
+            lifecycle_epoch=self._battery_power_lifecycle_epoch,
+            poll_generation=poll_generation,
+            retrieved_at=self._utcnow(),
+            battery_power_raw_w=None,
+            acquisition_valid=False,
+            acquired_at=None,
+            failure_class=failure_class,
+        )
+        return self._battery_power_acquisition
+
+    def _last_read_diagnostics(
+        self, data: dict[str, Any]
+    ) -> RegisterReadDiagnostics:
+        """Read the manager snapshot without performing more I/O."""
+        getter = getattr(self.modbus_manager, "get_last_read_diagnostics", None)
+        if callable(getter):
+            diagnostics = getter()
+            if isinstance(diagnostics, RegisterReadDiagnostics):
+                return diagnostics
+        return RegisterReadDiagnostics(connected=bool(data))
+
+    def _complete_battery_power_acquisition(
+        self,
+        data: dict[str, Any],
+        diagnostics: RegisterReadDiagnostics,
+        *,
+        poll_generation: int,
+    ) -> BatteryPowerAcquisition:
+        """Freeze physical evidence before presentation retention can run."""
+        if poll_generation != self._battery_power_poll_generation:
+            raise ValueError("battery-power poll generation is not current")
+
+        read_outcome = diagnostics.battery_power
+        if not diagnostics.connected:
+            failure = AcquisitionFailureClass.DISCONNECTED
+        elif not read_outcome.acquisition_valid:
+            if (
+                not data
+                and read_outcome.failure_class
+                is AcquisitionFailureClass.RANGE_MISSING
+            ):
+                failure = AcquisitionFailureClass.COMPLETE_POLL_FAILURE
+            else:
+                failure = read_outcome.failure_class
+        else:
+            failure = None
+
+        if (
+            self._battery_power_requires_fresh_sample
+            and diagnostics.connected
+            and failure is not None
+        ):
+            failure = AcquisitionFailureClass.RECONNECT_NO_FRESH_SAMPLE
+
+        if failure is not None:
+            return self._record_battery_power_failure(
+                failure, poll_generation=poll_generation
+            )
+
+        self._battery_power_acquisition = BatteryPowerAcquisition(
+            lifecycle_epoch=self._battery_power_lifecycle_epoch,
+            poll_generation=poll_generation,
+            retrieved_at=self._utcnow(),
+            battery_power_raw_w=read_outcome.battery_power_raw_w,
+            acquisition_valid=True,
+            acquired_at=read_outcome.sample_acquired_at,
+            failure_class=AcquisitionFailureClass.NONE,
+        )
+        self._battery_power_requires_fresh_sample = False
+        return self._battery_power_acquisition
+
     def is_register_available(self, address: int) -> bool:
         """Check if a register is available (not in unavailable set)."""
         return address not in self._unavailable_registers
@@ -652,6 +779,7 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
         base_entity.py -- would otherwise see stale pre-outage values.
         """
         self._consecutive_failures += 1
+        self._battery_power_requires_fresh_sample = True
         self._latest_data = {}
         self.data = {}
 
@@ -870,13 +998,22 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
         first call (via async_config_entry_first_refresh) that becomes
         ConfigEntryNotReady, so HA owns the retry schedule.
         """
+        poll_generation = self._begin_battery_power_poll()
+        physical_poll_started = False
+        acquisition_completed = False
         try:
             await self._async_connect_and_ensure_config()
 
+            physical_poll_started = True
             data = await self.modbus_manager.get_all_data(
                 self._device_config_cache,
                 batch_ranges=self._batch_ranges_cache,
             )
+            diagnostics = self._last_read_diagnostics(data)
+            self._complete_battery_power_acquisition(
+                data, diagnostics, poll_generation=poll_generation
+            )
+            acquisition_completed = True
             await self._update_unavailable_registers()
 
             if not data:
@@ -899,9 +1036,29 @@ class AnkerSolixOfficialCoordinator(DataUpdateCoordinator):
                     return self._latest_data
                 raise UpdateFailed(f"Empty data frame from {self.ip_address}")
         except UpdateFailed as err:
+            if not acquisition_completed:
+                self._complete_battery_power_acquisition(
+                    {},
+                    (
+                        self._last_read_diagnostics({})
+                        if physical_poll_started
+                        else RegisterReadDiagnostics()
+                    ),
+                    poll_generation=poll_generation,
+                )
             await self._handle_refresh_failure(str(err))
             raise
         except Exception as err:
+            if not acquisition_completed:
+                self._complete_battery_power_acquisition(
+                    {},
+                    (
+                        self._last_read_diagnostics({})
+                        if physical_poll_started
+                        else RegisterReadDiagnostics()
+                    ),
+                    poll_generation=poll_generation,
+                )
             await self._handle_refresh_failure(str(err))
             raise UpdateFailed(f"Error reading from {self.ip_address}: {err}") from err
 
