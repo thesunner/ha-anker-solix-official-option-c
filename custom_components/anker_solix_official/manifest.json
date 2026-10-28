@@ -15,8 +15,7 @@
   "issue_tracker": "https://github.com/anker-charging/ha-anker-solix-official/issues",
   "loggers": ["custom_components.anker_solix_official", "pymodbus"],
   "requirements": [
-    "pymodbus>=3.10.0,<4.0.0",
-    "PyYAML>=5.4.0"
+    "pymodbus>=3.10.0,<4.0.0"
   ],
   "version": "1.4.3-powermind-option-c.1"
 }
